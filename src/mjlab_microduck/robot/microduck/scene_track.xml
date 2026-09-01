@@ -1,0 +1,69 @@
+<mujoco model="scene_track">
+    <!-- Scene for scripts/ball_follow.py: the walking gait chases a draggable
+         yellow target ball.
+
+         The ball is a MOCAP body, which is the whole trick:
+           - it has no DOFs, so it never rolls, falls, or gets kicked away;
+           - its position is data.mocap_pos[0], read by the controller and
+             written by the mouse-drag handler;
+           - MuJoCo's own viewer interaction can move it too, because mocap
+             bodies are the one thing the perturb machinery grabs.
+         contype/conaffinity 0 keeps it out of collision entirely: it is a
+         target marker, not an obstacle, and a ball the robot trips over would
+         defeat a demo whose point is smooth following. -->
+    <include file="robot_allcollisions.xml" />
+
+    <visual>
+        <headlight diffuse="0.6 0.6 0.6" ambient="0.3 0.3 0.3" specular="0 0 0" />
+        <rgba haze="0.15 0.25 0.35 1" />
+        <global azimuth="160" elevation="-20" />
+    </visual>
+
+    <asset>
+        <texture type="skybox" builtin="gradient" rgb1="0.3 0.5 0.7" rgb2="0 0 0" width="512"
+            height="3072" />
+        <texture type="2d" name="groundplane" builtin="checker" mark="edge" rgb1="0.2 0.3 0.4"
+            rgb2="0.1 0.2 0.3"
+            markrgb="0.8 0.8 0.8" width="300" height="300" />
+        <material name="groundplane" texture="groundplane" texuniform="true" texrepeat="5 5"
+            reflectance="0.2" />
+    </asset>
+
+    <worldbody>
+        <light pos="0 0 3.5" dir="0 0 -1" directional="true" />
+        <geom name="floor" size="0 0 0.05" pos="0 0 0" type="plane" material="groundplane" />
+
+        <!-- The draggable target. Kept at head height so it reads as something
+             to walk toward rather than something on the floor to step over. -->
+        <body name="target_ball" mocap="true" pos="0.70 0 0.10">
+            <geom name="target_ball" type="sphere" size="0.04" rgba="1.0 0.85 0.05 1"
+                contype="0" conaffinity="0" />
+        </body>
+
+        <!-- A real ball for the kick tricks, which infer_policy.py's
+             _place_ball teleports in front of the kicking foot (it looks for a
+             joint literally named "ball_free"; without one the kick swings at
+             air). Parked far outside the drag area (the target ball is clamped
+             to 3 m) so it can never lie in the robot's path while walking, and
+             the scheduler parks it again after each kick. -->
+        <body name="ball" pos="20 20 0.035">
+            <freejoint name="ball_free" />
+            <geom name="ball" type="sphere" size="0.035" mass="0.015"
+                rgba="0.85 0.25 0.15 1" />
+        </body>
+    </worldbody>
+
+    <keyframe>
+        <key name="STAND" qpos="
+        0 0 0.125 1 0 0 0
+
+        0 -0.08726646259971647 -0.457924 -0.004940 0.452984
+        0.3490658503988659 0.3490658503988659 0 0
+        0 0.08726646259971647 0.457924 0.004940 -0.452984"
+         ctrl="
+        0 -0.08726646259971647 -0.457924 -0.004940 0.452984
+        0.3490658503988659 0.3490658503988659 0 0
+        0 0.08726646259971647 0.457924 0.004940 -0.452984"
+        />
+    </keyframe>
+</mujoco>

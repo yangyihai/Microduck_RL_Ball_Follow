@@ -60,6 +60,15 @@ SYMMETRY_CFG = {
     "data_augmentation_func": "mjlab_microduck.tasks.symmetry.microduck_vel_symmetry",
 }
 
+# BallFollow variant. Identical to SYMMETRY_CFG except for the function, whose
+# twist-slot signs differ — see _OBS_SIGN_BALL_FOLLOW.
+SYMMETRY_BALL_FOLLOW_CFG = {
+    "use_data_augmentation": False,
+    "use_mirror_loss": True,
+    "mirror_loss_coeff": 0.5,
+    "data_augmentation_func": "mjlab_microduck.tasks.symmetry.microduck_ball_follow_symmetry",
+}
+
 # ---------------------------------------------------------------------------
 # Permutation and sign tables
 # ---------------------------------------------------------------------------
@@ -94,20 +103,35 @@ _OBS_SIGN: list[float] = (
     + [1.0, -1.0, 1.0, -1.0, 1.0, -1.0]  # body: negate y, roll, yaw
 )
 
-# Cache tensors per device to avoid reallocating on every call
-_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]] = {}
+# BallFollow's twist slot carries [target_x, target_y, hold_distance] instead of
+# [lin_vel_x, lin_vel_y, ang_vel_z]. Under a left-right reflection:
+#   target_x -> target_x   (forward stays forward)
+#   target_y -> -target_y  (lateral flips)      — same as lin_vel_y
+#   hold_distance -> hold_distance (a distance has no left/right sign)
+# The last one is the trap: reusing the velocity table would negate the stand-off
+# distance, teaching the policy that the mirror image of "keep 0.35 m" is
+# "keep -0.35 m" — a command it can never be given. Only that entry differs.
+_OBS_SIGN_BALL_FOLLOW: list[float] = list(_OBS_SIGN)
+_OBS_SIGN_BALL_FOLLOW[48:51] = [1.0, -1.0, 1.0]
+
+# Cache tensors per device to avoid reallocating on every call.
+# Keyed by (device, variant) now that there are two sign tables.
+_cache: dict[tuple[torch.device, str], tuple[torch.Tensor, ...]] = {}
 
 
 def _get_tensors(
     device: torch.device,
+    variant: str = "velocity",
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    if device not in _cache:
+    key = (device, variant)
+    if key not in _cache:
+        sign_table = _OBS_SIGN if variant == "velocity" else _OBS_SIGN_BALL_FOLLOW
         obs_perm = torch.tensor(_OBS_PERM, dtype=torch.long, device=device)
-        obs_sign = torch.tensor(_OBS_SIGN, dtype=torch.float32, device=device)
+        obs_sign = torch.tensor(sign_table, dtype=torch.float32, device=device)
         act_perm = torch.tensor(_JOINT_PERM, dtype=torch.long, device=device)
         act_sign = torch.tensor(_JOINT_SIGN, dtype=torch.float32, device=device)
-        _cache[device] = (obs_perm, obs_sign, act_perm, act_sign)
-    return _cache[device]
+        _cache[key] = (obs_perm, obs_sign, act_perm, act_sign)
+    return _cache[key]
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +187,45 @@ def microduck_vel_symmetry(
 
     if actions is not None:
         _, _, act_perm, act_sign = _get_tensors(actions.device)
+        actions_sym = actions[:, act_perm] * act_sign
+        aug_actions = torch.cat([actions, actions_sym], dim=0)
+
+    return aug_obs, aug_actions
+
+
+def microduck_ball_follow_symmetry(
+    env,
+    obs: TensorDict | None,
+    actions: torch.Tensor | None,
+) -> tuple[TensorDict | None, torch.Tensor | None]:
+    """Symmetry augmentation for the BallFollow env.
+
+    Same as microduck_vel_symmetry except for the twist-slot signs: the slot
+    holds [target_x, target_y, hold_distance], and a stand-off distance is
+    unchanged by a left-right reflection (see _OBS_SIGN_BALL_FOLLOW).
+    """
+    aug_obs: TensorDict | None = None
+    aug_actions: torch.Tensor | None = None
+
+    if obs is not None:
+        actor_orig: torch.Tensor = obs["actor"]
+        obs_perm, obs_sign, _, _ = _get_tensors(actor_orig.device, "ball_follow")
+        actor_sym = actor_orig[:, obs_perm] * obs_sign
+
+        critic_orig: torch.Tensor = obs["critic"]
+        critic_repeated = torch.cat([critic_orig, critic_orig], dim=0)
+
+        aug_obs = TensorDict(
+            {
+                "actor": torch.cat([actor_orig, actor_sym], dim=0),
+                "critic": critic_repeated,
+            },
+            batch_size=[actor_orig.shape[0] * 2],
+            device=actor_orig.device,
+        )
+
+    if actions is not None:
+        _, _, act_perm, act_sign = _get_tensors(actions.device, "ball_follow")
         actions_sym = actions[:, act_perm] * act_sign
         aug_actions = torch.cat([actions, actions_sym], dim=0)
 

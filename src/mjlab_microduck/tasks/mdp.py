@@ -1,11 +1,12 @@
 """MDP functions for microduck tasks"""
 
+import abc
 import math
 from dataclasses import dataclass as _dataclass
 
 import numpy as np
 import torch
-from typing import TYPE_CHECKING, Optional
+from typing import TYPE_CHECKING, Any, Callable, Optional
 import mujoco
 
 from mjlab.envs.manager_based_rl_env import ManagerBasedRlEnv
@@ -7186,3 +7187,371 @@ def roulade_lateral_velocity_penalty(
     """Body-frame lateral (y) linear velocity² — keeps the roll straight."""
     asset: Entity = env.scene[asset_cfg.name]
     return torch.nan_to_num(asset.data.root_link_lin_vel_b[:, 1].pow(2), nan=0.0)
+
+
+# --------------------------------------------------------------------------- #
+# Ball-follow (target-seeking) command machinery                                #
+# --------------------------------------------------------------------------- #
+#
+# The task: walk to a target and hold a commanded stand-off distance from it,
+# re-acquiring whenever the target moves (the sim2real analogue of the operator
+# dragging the yellow ball in scripts/ball_follow.py).
+#
+# Where does the target live in the observation?
+# ----------------------------------------------
+# The 61D actor obs has no slot for "where is the thing I am chasing" — the
+# layout is 48D proprioception + a 13D command block. So the target rides in the
+# command block, exactly the way this repo already redefines it per task:
+# sitstand uses twist[0] as a posture flag, ball_kick zeroes it. Redefining the
+# 3 twist slots as
+#
+#     [target_x_body, target_y_body, hold_distance]
+#
+# keeps the width at 61, so robotd's obs-width check, the ONNX shape and the
+# export path are all untouched. Only the *meaning* of those 3 numbers changes,
+# and the runtime is what fills the command block anyway (duck-control
+# obs.rs) — so feeding it a target position instead of a velocity is a change in
+# what the upper layer writes, not in the protocol's shape.
+#
+# Consequence worth stating plainly: hot-swap only works between policies that
+# share a command semantics. A velocity policy handed a target position will
+# read target_x as a forward speed. That is already true of sitstand.
+#
+# Why a virtual target and not a prop?
+# ------------------------------------
+# The demo's yellow ball is a mocap body with collisions off, because a ball the
+# robot can kick away stops being a target. Training does not need the prop at
+# all: the target is stored as a world point in the command term, and drawn with
+# debug_vis. No reset ordering, no contacts, no nconmax budget.
+# --------------------------------------------------------------------------- #
+
+
+class TargetProvider(abc.ABC):
+    """Where the target comes from. Swap this, not the command term.
+
+    This is the seam for everything the task author might want to change about
+    *what the robot is chasing*, without touching the command term, the rewards
+    or the observation layout:
+
+      - a moving target instead of a static one (DriftingTargetProvider);
+      - a scripted path — laps, slaloms, a recorded walk (subclass and write
+        `targets()`);
+      - a curriculum that starts close and recedes (subclass, read
+        `env.common_step_counter`);
+      - replaying real detections, or feeding them in from a sensor
+        (CallbackTargetProvider).
+
+    Contract
+    --------
+    `targets()` returns world-frame positions, shape [num_envs, 3]. It is called
+    on every `_update_command`, i.e. after the sim has been read, so
+    `root_link_pos_w` is current if you need the robot's pose.
+
+    `reset(env_ids)` is your chance to move the target. It is called from
+    `_resample_command`, which runs during `command_manager.reset()` — BEFORE
+    the next `scene.update()`, so do NOT read the robot pose there: you would
+    get the previous episode's. Sample relative quantities and resolve them
+    against the robot pose inside `targets()` instead.
+    """
+
+    def __init__(self, num_envs: int, device: torch.device, cfg):
+        self.num_envs = num_envs
+        self.device = device
+        self.cfg = cfg
+
+    @abc.abstractmethod
+    def reset(self, env_ids: torch.Tensor) -> None:
+        """(Re)draw the target for these envs. Do not read the robot pose here."""
+
+    @abc.abstractmethod
+    def targets(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+        """World-frame target positions, [num_envs, 3]."""
+
+
+class RandomPolarTargetProvider(TargetProvider):
+    """Static target, placed at a random range/bearing around the robot.
+
+    The default, and the training analogue of the operator dropping the ball
+    somewhere new: the target jumps to a fresh spot every resample interval and
+    then holds still. Bearing is relative to the robot's heading, so the full
+    circle of approach directions is covered — including from behind, which is
+    the case that forces a turn.
+    """
+
+    def __init__(self, num_envs: int, device: torch.device, cfg):
+        super().__init__(num_envs, device, cfg)
+        self._dist = torch.zeros(num_envs, device=device)
+        self._bearing = torch.zeros(num_envs, device=device)
+        self._pos_w = torch.zeros(num_envs, 3, device=device)
+        # Nothing placed until the first update, when the pose is readable.
+        self._stale = torch.ones(num_envs, dtype=torch.bool, device=device)
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        n = len(env_ids)
+        if n == 0:
+            return
+        self._dist[env_ids] = torch.empty(
+            n, device=self.device).uniform_(*self.cfg.target_distance_range)
+        self._bearing[env_ids] = torch.empty(
+            n, device=self.device).uniform_(*self.cfg.target_bearing_range)
+        self._stale[env_ids] = True
+
+    def targets(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+        robot = env.scene["robot"]
+        if self._stale.any():
+            ids = self._stale.nonzero().flatten()
+            root_pos = robot.data.root_link_pos_w[ids]
+            rot = matrix_from_quat(robot.data.root_link_quat_w[ids])
+            yaw = torch.atan2(rot[:, 1, 0], rot[:, 0, 0])
+            bearing = yaw + self._bearing[ids]
+            d = self._dist[ids]
+            self._pos_w[ids, 0] = root_pos[:, 0] + d * torch.cos(bearing)
+            self._pos_w[ids, 1] = root_pos[:, 1] + d * torch.sin(bearing)
+            self._pos_w[ids, 2] = self.cfg.target_height
+            self._stale[ids] = False
+        return self._pos_w
+
+
+class DriftingTargetProvider(RandomPolarTargetProvider):
+    """A target that keeps moving — the operator dragging the ball around.
+
+    Harder than the static version and closer to the real use: the policy has to
+    keep re-acquiring, not just solve the approach once. Starts from the same
+    polar draw, then moves at a constant speed in a fixed world direction,
+    bouncing off `arena_radius` so targets stay in the training area.
+    """
+
+    def __init__(self, num_envs: int, device: torch.device, cfg):
+        super().__init__(num_envs, device, cfg)
+        self._vel = torch.zeros(num_envs, 2, device=device)
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        super().reset(env_ids)
+        n = len(env_ids)
+        if n == 0:
+            return
+        angle = torch.empty(n, device=self.device).uniform_(-math.pi, math.pi)
+        speed = torch.empty(n, device=self.device).uniform_(*self.cfg.drift_speed_range)
+        self._vel[env_ids, 0] = speed * torch.cos(angle)
+        self._vel[env_ids, 1] = speed * torch.sin(angle)
+
+    def targets(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+        pos = super().targets(env)
+        # World-frame advance, then reflect at the arena edge so no env ends up
+        # chasing a target off to infinity.
+        pos[:, :2] += self._vel
+        r = torch.linalg.norm(pos[:, :2], dim=-1)
+        over = r > self.cfg.arena_radius
+        if over.any():
+            scale = (self.cfg.arena_radius / r[over]).clamp(max=1.0)
+            pos[over, :2] *= scale.unsqueeze(-1)
+            self._vel[over] *= -1.0
+        return pos
+
+
+class CallbackTargetProvider(TargetProvider):
+    """Hand target generation to a Python callable.
+
+    The escape hatch for sources the built-in providers do not cover — feeding
+    in detections, replaying a recorded path, or a curriculum with custom logic:
+
+        CallbackTargetProvider(n, device, cfg, fn=my_target_fn)
+
+    `fn(env) -> Tensor[num_envs, 3]` in world frame. It runs every step, after
+    the sim has been read, so `env.scene["robot"].data.root_link_pos_w` is
+    current. Keep it cheap and batched: this is on the hot path of every env
+    step, and a Python-side loop here will dominate step time.
+    """
+
+    def __init__(self, num_envs: int, device: torch.device, cfg, fn=None):
+        super().__init__(num_envs, device, cfg)
+        # The command term builds providers as cls(num_envs, device, cfg) and
+        # cannot pass extras, so the callable comes from the cfg. Set it with
+        # BallFollowCommandCfg(target_provider_cls=CallbackTargetProvider,
+        # target_fn=my_fn).
+        fn = fn if fn is not None else getattr(cfg, "target_fn", None)
+        if fn is None:
+            raise ValueError(
+                "CallbackTargetProvider needs a callable: pass target_fn=fn to "
+                "BallFollowCommandCfg, where fn(env) -> Tensor[num_envs, 3]."
+            )
+        self._fn = fn
+        self._pos_w = torch.zeros(num_envs, 3, device=device)
+
+    def reset(self, env_ids: torch.Tensor) -> None:
+        return  # the callback owns its own state
+
+    def targets(self, env: ManagerBasedRlEnv) -> torch.Tensor:
+        out = self._fn(env)
+        if not isinstance(out, torch.Tensor) or out.shape != self._pos_w.shape:
+            raise ValueError(
+                f"target callback must return a tensor of shape "
+                f"{tuple(self._pos_w.shape)}, got "
+                f"{tuple(out.shape) if isinstance(out, torch.Tensor) else type(out)}"
+            )
+        self._pos_w[:] = out
+        return self._pos_w
+
+
+class BallFollowCommand(CommandTerm):
+    """Seek-and-hold command: [target_x, target_y, hold_distance] in body frame.
+
+    Owns *where the target is* (delegated to a :class:`TargetProvider`) and
+    turns it into the command block (world -> body reprojection, which is the
+    part that makes this tracking rather than three fixed numbers).
+
+    To change what the robot chases, pass a different `target_provider` to
+    :class:`BallFollowCommandCfg`. To change how the command is *shaped*, change
+    this class.
+    """
+
+    cfg: "BallFollowCommandCfg"
+
+    def __init__(self, cfg: "BallFollowCommandCfg", env: ManagerBasedRlEnv):
+        super().__init__(cfg, env)
+        self.dim = 3
+        # [forward, lateral, hold_distance]
+        self._command = torch.zeros(self.num_envs, 3, device=self.device)
+        self._hold_distance = torch.zeros(self.num_envs, device=self.device)
+        self._provider = cfg.target_provider_cls(self.num_envs, self.device, cfg)
+        # distance error, for the wandb metrics only
+        self.metrics["target_distance_error"] = torch.zeros(
+            self.num_envs, device=self.device)
+
+    @property
+    def command(self) -> torch.Tensor:
+        return self._command
+
+    @property
+    def target_pos_w(self) -> torch.Tensor:
+        """World-frame target positions, for debug vis and metrics."""
+        return self._provider.targets(self._env)
+
+    def _resample_command(self, env_ids: torch.Tensor) -> None:
+        self._provider.reset(env_ids)
+        n = len(env_ids)
+        if n:
+            self._hold_distance[env_ids] = torch.empty(
+                n, device=self.device).uniform_(*self.cfg.hold_distance_range)
+
+    def _update_command(self) -> None:
+        """Reproject the world target into the body frame every step."""
+        robot = self._env.scene["robot"]
+        target_w = self._provider.targets(self._env)
+
+        rel = target_w - robot.data.root_link_pos_w
+        rot = matrix_from_quat(robot.data.root_link_quat_w)
+        local = torch.bmm(rot.transpose(1, 2), rel.unsqueeze(-1)).squeeze(-1)
+
+        self._command[:, 0] = local[:, 0]
+        self._command[:, 1] = local[:, 1]
+        self._command[:, 2] = self._hold_distance
+
+    def _update_metrics(self) -> None:
+        dist = torch.linalg.norm(self._command[:, :2], dim=-1)
+        self.metrics["target_distance_error"] = torch.nan_to_num(
+            dist - self._hold_distance, nan=0.0)
+
+    def _debug_vis_impl(self, visualizer) -> None:
+        if not hasattr(visualizer, "add_sphere"):
+            return
+        visualizer.add_sphere(
+            self.target_pos_w, radius=0.04, color=(1.0, 0.85, 0.05, 0.9))
+
+
+@_dataclass(kw_only=True)
+class BallFollowCommandCfg(CommandTermCfg):
+    """Seek-and-hold target command; builds a BallFollowCommand."""
+
+    # Which TargetProvider to use. Override to change what the robot chases;
+    # see TargetProvider's docs for the choices.
+    target_provider_cls: type = RandomPolarTargetProvider
+    # Callable for CallbackTargetProvider: fn(env) -> Tensor[num_envs, 3] in
+    # world frame. Only that provider reads it. It cannot be a constructor
+    # argument because the command term builds providers uniformly as
+    # cls(num_envs, device, cfg).
+    target_fn: Any = None
+
+    # --- RandomPolarTargetProvider / DriftingTargetProvider ------------------
+    # How far from the robot a fresh target is placed (m).
+    target_distance_range: tuple[float, float] = (0.3, 1.5)
+    # Bearing of a fresh target relative to the robot's heading (rad).
+    target_bearing_range: tuple[float, float] = (-3.14159, 3.14159)
+    # Height of the target point (m). Horizontal distance is what is tracked;
+    # this only sets where the marker is drawn.
+    target_height: float = 0.10
+    # --- DriftingTargetProvider only -----------------------------------------
+    # Constant target speed (m/s) and the radius it is kept inside (m).
+    drift_speed_range: tuple[float, float] = (0.05, 0.15)
+    arena_radius: float = 3.0
+    # --- task-level ----------------------------------------------------------
+    # Stand-off distance the policy must hold (m).
+    hold_distance_range: tuple[float, float] = (0.25, 0.45)
+    # Seconds between target moves. Short relative to the episode so a run sees
+    # several re-acquisitions, not just one approach.
+    resampling_time_range: tuple[float, float] = (4.0, 8.0)
+    debug_vis: bool = True
+
+    def build(self, env: ManagerBasedRlEnv) -> "BallFollowCommand":
+        return BallFollowCommand(self, env)
+
+
+def ball_follow_distance_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.15,
+) -> torch.Tensor:
+    """Gaussian on the stand-off error: peaks when |target| == hold_distance.
+
+    Two-sided on purpose. Rewarding "get closer" alone teaches the robot to walk
+    into the target; rewarding distance alone lets it loiter at the reset
+    radius. Only a band around the commanded stand-off says "follow, and keep
+    your distance".
+
+    `std` is in metres of error, so it sets how sharply the band is enforced —
+    it is the tuning knob for how precisely the robot has to park.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    dist = torch.linalg.norm(cmd[:, :2], dim=-1)
+    hold = cmd[:, 2]
+    err = dist - hold
+    return torch.exp(-(err / std).pow(2))
+
+
+def ball_follow_facing_reward(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    std: float = 0.5,
+) -> torch.Tensor:
+    """Gaussian on the bearing to the target: peaks when it is straight ahead.
+
+    Distance alone is satisfied from any direction, so without a facing term the
+    robot can sidle up backwards or crab sideways. Capped by `std` in radians.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    bearing = torch.atan2(cmd[:, 1], cmd[:, 0])
+    return torch.exp(-(bearing / std).pow(2))
+
+
+def ball_follow_hold_still_penalty(
+    env: ManagerBasedRlEnv,
+    command_name: str = "twist",
+    asset_cfg: SceneEntityCfg = _DEFAULT_ASSET_CFG,
+    tolerance: float = 0.08,
+) -> torch.Tensor:
+    """Horizontal speed, but only while parked at the stand-off distance.
+
+    Use with a NEGATIVE weight. The stand-off reward saturates once the band is
+    reached, which leaves nothing to stop the robot shuffling in place; this
+    penalises movement only inside the band, so it prices loitering without
+    taxing the approach itself. Gated (not scaled) by the band so the gradient
+    does not fight the distance term during the walk in.
+    """
+    cmd = env.command_manager.get_command(command_name)
+    dist = torch.linalg.norm(cmd[:, :2], dim=-1)
+    err = (dist - cmd[:, 2]).abs()
+    in_band = (err < tolerance).float()
+
+    asset: Entity = env.scene[asset_cfg.name]
+    speed = torch.linalg.norm(asset.data.root_link_lin_vel_w[:, :2], dim=-1)
+    return torch.nan_to_num(in_band * speed, nan=0.0)

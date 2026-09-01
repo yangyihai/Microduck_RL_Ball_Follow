@@ -39,6 +39,10 @@ from .microduck_sitstand_env_cfg import (
     make_microduck_sitstand_env_cfg,
     MicroduckSitStandRlCfg,
 )
+from .microduck_ball_follow_env_cfg import (
+    make_microduck_ball_follow_env_cfg,
+    MicroduckBallFollowRlCfg,
+)
 from .microduck_velocity_rollers_env_cfg import (
     make_microduck_velocity_rollers_env_cfg,
     MicroduckRollersRlCfg,
@@ -161,6 +165,18 @@ register_mjlab_task(
     env_cfg=make_microduck_ground_pick_env_cfg(rough=True),
     play_env_cfg=make_microduck_ground_pick_env_cfg(play=True, rough=True),
     rl_cfg=MicroduckGroundPickRlCfg,
+    runner_cls=MicroduckOnPolicyRunner,
+)
+
+# BallFollow — walk to a target and hold a commanded stand-off distance.
+# Training-side counterpart of scripts/ball_follow.py; see that env's module
+# docstring for why this is worth training end to end. Flat only: rough ground
+# would confound the stand-off objective with terrain noise.
+register_mjlab_task(
+    task_id="Mjlab-BallFollow-Flat-MicroDuck",
+    env_cfg=make_microduck_ball_follow_env_cfg(),
+    play_env_cfg=make_microduck_ball_follow_env_cfg(play=True),
+    rl_cfg=MicroduckBallFollowRlCfg,
     runner_cls=MicroduckOnPolicyRunner,
 )
 

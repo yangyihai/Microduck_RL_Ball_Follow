@@ -138,10 +138,20 @@ class PolicyInference:
                  sitstand_onnx_path=None,
                  kick_left_onnx_path=None, kick_right_onnx_path=None,
                  roulade_onnx_path=None,
-                 kick_duration=3.0, roulade_duration=2.0):
+                 kick_duration=3.0, roulade_duration=2.0,
+                 head_lowpass=1.0, legs_lowpass=1.0):
         self.model = model
         self.data = data
         self.action_scale = action_scale
+        # First-order low-pass on the joint targets, as the runtime applies them.
+        # 1.0 is pass-through (off). robotd defaults to head 0.5 / legs 0.7
+        # (deploy/robotd.toml, duck-control/src/control.rs) — the values the alpha
+        # policies are trained with — so a rehearsal meant to predict real-robot
+        # behaviour has to run the same filters or it is not rehearsing the same
+        # controller.
+        self.head_lowpass = head_lowpass
+        self.legs_lowpass = legs_lowpass
+        self.previous_targets = None
         self.use_projected_gravity = use_projected_gravity
         self.delay_min_lag = delay_min_lag
         self.delay_max_lag = delay_max_lag
@@ -793,6 +803,23 @@ class PolicyInference:
         else:
             target_positions = self.default_pose + action * self.action_scale
 
+        # Same filter as duck-control/src/control.rs: a first-order low-pass on
+        # the joint targets, head on its own alpha and the legs on theirs, with
+        # the mouth left out (it has no actuator here — model.nu is 14).
+        if self.previous_targets is not None:
+            if self.head_lowpass < 1.0:
+                a = self.head_lowpass
+                target_positions[5:9] = (
+                    a * target_positions[5:9] + (1.0 - a) * self.previous_targets[5:9]
+                )
+            if self.legs_lowpass < 1.0:
+                a = self.legs_lowpass
+                legs = [0, 1, 2, 3, 4, 9, 10, 11, 12, 13]
+                target_positions[legs] = (
+                    a * target_positions[legs] + (1.0 - a) * self.previous_targets[legs]
+                )
+        self.previous_targets = target_positions.copy()
+
         self.data.ctrl[:] = target_positions
         # Legacy mode: head_offset is an external perturbation added on top of
         # the policy output. New mode: head_offset is a COMMAND fed into the
@@ -819,6 +846,12 @@ def main():
     parser.add_argument("--lin-vel-y", type=float, default=0.0, help="Initial linear velocity Y command (m/s)")
     parser.add_argument("--ang-vel-z", type=float, default=0.0, help="Initial angular velocity Z command (rad/s)")
     parser.add_argument("--action-scale", type=float, default=1.0, help="Action scale (default: 1.0)")
+    parser.add_argument("--head-lowpass", type=float, default=1.0,
+                        help="First-order low-pass on head joint targets, 1.0 = off (default). "
+                             "robotd uses 0.5 — the alpha policies are trained with it, so set this "
+                             "to match when the rehearsal is meant to predict real-robot behaviour.")
+    parser.add_argument("--legs-lowpass", type=float, default=1.0,
+                        help="Same, for the ten leg joints. robotd uses 0.7 (default here: 1.0 = off).")
     parser.add_argument("--raw-accelerometer", action="store_true", help="Use raw accelerometer instead of projected gravity")
     parser.add_argument("--delay", type=int, nargs='*', default=None, help="Enable actuator delay: --delay MIN MAX or --delay LAG")
     parser.add_argument("--debug", action="store_true", help="Print observations and actions")
@@ -922,6 +955,8 @@ def main():
         model, data,
         walking_onnx_path=args.walking,
         action_scale=args.action_scale,
+        head_lowpass=args.head_lowpass,
+        legs_lowpass=args.legs_lowpass,
         delay_min_lag=delay_min_lag,
         delay_max_lag=delay_max_lag,
         standing_onnx_path=args.standing,
